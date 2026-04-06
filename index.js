@@ -189,19 +189,56 @@ async function sendMediaToGroups({ item, caption, groupIds }) {
   };
 }
 
+async function sendMediaToStatus({ item, caption }) {
+  const client = state.client;
+  if (!client || !state.ready) throw new Error('WhatsApp no conectado');
+  if (!item?.media) throw new Error('No hay media pendiente');
+
+  const statusChatId = 'status@broadcast';
+  const options = {};
+  if (caption) options.caption = caption;
+  await withTimeout(
+    client.sendMessage(statusChatId, item.media, options),
+    GROUP_SEND_TIMEOUT_MS,
+    'Status publish timeout'
+  );
+  console.log('[WA] Estado publicado OK');
+}
+
+// Throttle: máximo 1 auto-respuesta por contacto cada AUTO_REPLY_COOLDOWN_MS
+const AUTO_REPLY_COOLDOWN_MS = Number(process.env.AUTO_REPLY_COOLDOWN_MS || 3600000);
+const autoReplySent = new Map();
+function autoReplyThrottle(from) {
+  const now = Date.now();
+  const last = autoReplySent.get(from) || 0;
+  if (now - last < AUTO_REPLY_COOLDOWN_MS) return false;
+  autoReplySent.set(from, now);
+  if (autoReplySent.size > 100) {
+    for (const [k, v] of autoReplySent) {
+      if (now - v > AUTO_REPLY_COOLDOWN_MS) autoReplySent.delete(k);
+    }
+  }
+  return true;
+}
+
 function extractDirectTextIntent(text) {
   const t = String(text || '').trim();
   const low = t.toLowerCase();
 
   if (!t) return null;
   if (['!status', 'status'].includes(low)) return { action: 'status' };
-  if (['!grupos', '!listar', 'grupos', 'lista grupos'].includes(low)) return { action: 'list_groups' };
+  if (['!grupos', '!listar', 'lista grupos'].includes(low)) return { action: 'list_groups' };
   if (['!test', '!test-grupos'].includes(low)) return { action: 'test_groups' };
   if (['!clear', '!limpiar', '!cancelar'].includes(low)) return { action: 'clear_pending' };
   if (['!reauth', '!reautenticar'].includes(low)) return { action: 'reauth' };
 
+  // "estados" o "ambos" para publicar en estados de WA
+  if (/^(estados|estado)$/i.test(t)) return { action: 'send_pending', target: 'status' };
+  if (/^(ambos|todo|grupos\s*y\s*estados|estados\s*y\s*grupos)$/i.test(t)) return { action: 'send_pending', target: 'both' };
+
+  // "grupos" sin ! = enviar pendiente (no listar)
   if (/^(grupos|envia a grupos|manda a grupos|mandar a grupos|publica en grupos|mandalo a grupos|mándalo a grupos|mandalos a grupos|mándalos a grupos)$/i.test(t)) {
-    return { action: 'send_pending' };
+    return { action: 'send_pending', target: 'groups' };
   }
 
   const directMatch = t.match(/^(manda|envia|envía|publica)\s+(esto\s+)?a\s+grupos\s*:?\s*([\s\S]+)$/i);
@@ -290,21 +327,43 @@ async function handleAdminTextMessage(msg) {
     return;
   }
 
-  // --- Si hay media pendiente, priorizar envío sobre listado ---
+  // --- Si hay media pendiente ---
   if (pendingExists()) {
-    if (direct?.action === 'send_pending' || direct?.action === 'list_groups') {
-      // "grupos" con media pendiente = enviar, no listar
+    if (direct?.action === 'send_pending') {
       const caption = direct.caption || state.pending.caption || '';
       const item = state.pending.items[state.pending.items.length - 1];
-      const result = await sendMediaToGroups({ item, caption });
-      await msg.reply(`📤 Envío de media completado.\n✅ ${result.exitosos} ok\n❌ ${result.fallidos} fallidos`);
+      const target = direct.target || 'groups';
+      let replyParts = [];
+
+      if (target === 'groups' || target === 'both') {
+        const result = await sendMediaToGroups({ item, caption });
+        replyParts.push(`👥 Grupos: ✅ ${result.exitosos} ok, ❌ ${result.fallidos} fallidos`);
+      }
+      if (target === 'status' || target === 'both') {
+        try {
+          await sendMediaToStatus({ item, caption });
+          replyParts.push('📱 Estado de WhatsApp: ✅ publicado');
+        } catch (err) {
+          replyParts.push(`📱 Estado de WhatsApp: ❌ ${err.message}`);
+        }
+      }
+
+      await msg.reply(`📤 Envío completado.\n${replyParts.join('\n')}`);
       clearPending();
       return;
     }
 
-    // Si hay media pendiente y mandó texto, lo tomamos como caption.
+    // !grupos con media pendiente = listar, NO enviar
+    if (direct?.action === 'list_groups') {
+      const groups = await getSendableGroups().catch(() => []);
+      const preview = groups.slice(0, 10).map((g, i) => `${i + 1}. ${g.nombre}`).join('\n');
+      await msg.reply(`👥 Grupos válidos: ${groups.length}\n\n${preview || 'Sin grupos detectados.'}`);
+      return;
+    }
+
+    // Cualquier otro texto = caption
     state.pending.caption = text;
-    await msg.reply('📝 Caption guardado. Ahora escribe *grupos* para publicarlo.');
+    await msg.reply('📝 Caption guardado. Ahora escribe:\n• *grupos* → enviar a grupos\n• *estados* → publicar en estado de WA\n• *ambos* → grupos + estado');
     return;
   }
 
@@ -374,7 +433,7 @@ async function handleAdminTextMessage(msg) {
   }
 
   // Fallback simple
-  await msg.reply('🤖 Puedo ayudarte así:\n• Manda una imagen/video y luego escribe *grupos*\n• O manda texto como: *manda esto a grupos: tu promo aquí*\n• Comandos: !status, !grupos, !test, !clear, !reauth');
+  await msg.reply('🤖 Puedo ayudarte así:\n• Manda una imagen/video y luego: *grupos*, *estados* o *ambos*\n• Texto directo: *manda esto a grupos: tu promo aquí*\n• Comandos: !status, !grupos, !test, !clear, !reauth');
 }
 
 async function handleAdminMediaMessage(msg) {
@@ -390,10 +449,11 @@ async function handleAdminMediaMessage(msg) {
   state.pending.caption = String(msg.body || '').trim() || state.pending.caption || '';
 
   const label = kind === 'video' ? 'video' : kind === 'image' ? 'imagen' : 'archivo';
+  const opciones = '• *grupos* → enviar a grupos\n• *estados* → publicar en estado de WA\n• *ambos* → grupos + estado';
   if (state.pending.caption) {
-    await msg.reply(`📎 Recibí 1 ${label}. Caption guardado.\nEscribe *grupos* para enviarlo a todos los grupos válidos.`);
+    await msg.reply(`📎 Recibí 1 ${label}. Caption guardado.\n\n${opciones}`);
   } else {
-    await msg.reply(`📎 Recibí 1 ${label}.\nMándame el texto que llevará y luego escribe *grupos*.`);
+    await msg.reply(`📎 Recibí 1 ${label}.\nMándame el texto y luego elige destino:\n\n${opciones}`);
   }
 }
 
@@ -493,8 +553,14 @@ function attachClientEvents(client) {
   client.on('message', async (msg) => {
     try {
       if (msg.fromMe) return;
-      if (!isAdminMessage(msg)) return;
       if (msg.from.endsWith('@g.us')) return;
+
+      // Auto-respuesta a no-admins
+      if (!isAdminMessage(msg)) {
+        if (!autoReplyThrottle(msg.from)) return; // evitar spam
+        await msg.reply('📢 Este número es solo de *avisos y promociones*.\n\n📲 Para atención escribe al *496 147 43 57*\n¡Gracias!');
+        return;
+      }
 
       if (msg.hasMedia) {
         await handleAdminMediaMessage(msg);
@@ -502,7 +568,7 @@ function attachClientEvents(client) {
       }
       await handleAdminTextMessage(msg);
     } catch (err) {
-      console.error('[WA] Error manejando mensaje admin:', err.message);
+      console.error('[WA] Error manejando mensaje:', err.message);
       try {
         await msg.reply(`❌ Error: ${err.message}`);
       } catch (_) {}
