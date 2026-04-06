@@ -1,0 +1,17 @@
+{
+  "name": "wa-grupos-wwebjs",
+  "version": "1.0.0",
+  "description": "WhatsApp Groups Publisher con whatsapp-web.js para Railway",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "qrcode": "^1.5.4",
+    "whatsapp-web.js": "^1.34.1"
+  }
+}
