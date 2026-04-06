@@ -22,6 +22,13 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
 
+// URLs de workers para broadcast de estados (separadas por coma)
+// Ej: "https://wa-worker1.up.railway.app,https://wa-worker2.up.railway.app"
+const WORKER_URLS = (process.env.WORKER_URLS || '')
+  .split(',')
+  .map(u => u.trim())
+  .filter(Boolean);
+
 const state = {
   connected: false,
   ready: false,
@@ -205,6 +212,39 @@ async function sendMediaToStatus({ item, caption }) {
   console.log('[WA] Estado publicado OK');
 }
 
+// Broadcast status a este servicio + todos los workers
+async function broadcastStatus({ item, caption }) {
+  const results = [];
+
+  // Publicar en este mismo servicio
+  try {
+    await sendMediaToStatus({ item, caption });
+    results.push({ url: 'local', ok: true });
+  } catch (err) {
+    results.push({ url: 'local', ok: false, error: err.message });
+  }
+
+  // Publicar en cada worker
+  for (const workerUrl of WORKER_URLS) {
+    try {
+      const base64 = item.media.data;
+      const mimetype = item.media.mimetype;
+      const filename = item.media.filename || 'archivo';
+      const res = await fetch(`${workerUrl}/status/publicar`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },
+        body: JSON.stringify({ media_base64: base64, mimetype, filename, caption }),
+      });
+      const data = await res.json();
+      results.push({ url: workerUrl, ok: data.ok, error: data.error });
+    } catch (err) {
+      results.push({ url: workerUrl, ok: false, error: err.message });
+    }
+  }
+
+  return results;
+}
+
 // Throttle: máximo 1 auto-respuesta por contacto cada AUTO_REPLY_COOLDOWN_MS
 const AUTO_REPLY_COOLDOWN_MS = Number(process.env.AUTO_REPLY_COOLDOWN_MS || 3600000);
 const autoReplySent = new Map();
@@ -341,10 +381,12 @@ async function handleAdminTextMessage(msg) {
       }
       if (target === 'status' || target === 'both') {
         try {
-          await sendMediaToStatus({ item, caption });
-          replyParts.push('📱 Estado de WhatsApp: ✅ publicado');
+          const statusResults = await broadcastStatus({ item, caption });
+          const okCount = statusResults.filter(r => r.ok).length;
+          const failCount = statusResults.filter(r => !r.ok).length;
+          replyParts.push(`📱 Estados: ✅ ${okCount} ok, ❌ ${failCount} fallidos`);
         } catch (err) {
-          replyParts.push(`📱 Estado de WhatsApp: ❌ ${err.message}`);
+          replyParts.push(`📱 Estados: ❌ ${err.message}`);
         }
       }
 
@@ -755,11 +797,28 @@ app.get('/sesion/limpiar', auth, async (_req, res) => {
   res.json({ ok: true, message: 'Sesión borrada. Usa /reauth o recarga para generar QR.' });
 });
 
+// Endpoint para que el hub publique estado en este worker
+app.post('/status/publicar', auth, async (req, res) => {
+  try {
+    const { media_base64, mimetype, filename, caption } = req.body;
+    if (!state.ready) return res.status(400).json({ ok: false, error: 'WhatsApp no conectado' });
+    if (!media_base64) return res.status(400).json({ ok: false, error: 'Falta media_base64' });
+
+    const media = new MessageMedia(mimetype || 'image/jpeg', media_base64, filename || 'archivo');
+    const item = { media, kind: inferMediaKind(mimetype) };
+    await sendMediaToStatus({ item, caption: caption || '' });
+    res.json({ ok: true, message: 'Estado publicado' });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`[SERVER] Puerto ${PORT}`);
   console.log(`[SERVER] Session ID: ${SESSION_ID}`);
   console.log(`[SERVER] Admin: ${ADMIN_PHONE || 'no-configurado'}`);
   console.log(`[SERVER] Auth path: ${AUTH_PATH}`);
+  console.log(`[SERVER] Workers: ${WORKER_URLS.length ? WORKER_URLS.join(', ') : 'ninguno (hub solo)'}`);
 });
 
 // Limpiar lock files de Chromium que sobreviven reinicios en Railway
