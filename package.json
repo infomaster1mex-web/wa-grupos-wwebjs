@@ -1,7 +1,7 @@
 {
-  "name": "wa-grupos-wwebjs",
-  "version": "1.0.0",
-  "description": "WhatsApp Groups Publisher con whatsapp-web.js para Railway",
+  "name": "wa-grupos-wwebjs-ia",
+  "version": "2.0.0",
+  "description": "Bot de grupos con whatsapp-web.js, control por WhatsApp del admin y soporte IA opcional",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
