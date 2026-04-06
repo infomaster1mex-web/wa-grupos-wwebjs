@@ -542,6 +542,8 @@ async function startClient() {
           '--no-zygote',
           '--disable-accelerated-2d-canvas',
           '--single-process',
+          '--no-first-run',
+          '--disable-features=LockProfileCookieDatabase',
         ],
       },
     });
@@ -693,6 +695,21 @@ app.listen(PORT, () => {
   console.log(`[SERVER] Admin: ${ADMIN_PHONE || 'no-configurado'}`);
   console.log(`[SERVER] Auth path: ${AUTH_PATH}`);
 });
+
+// Limpiar lock files de Chromium que sobreviven reinicios en Railway
+try {
+  const { execSync } = require('child_process');
+  const out = execSync(`find ${AUTH_ROOT} /tmp -name 'SingletonLock' -o -name 'SingletonCookie' -o -name 'SingletonSocket' -o -name 'lockfile' 2>/dev/null || true`).toString().trim();
+  if (out) {
+    for (const f of out.split('\n').filter(Boolean)) {
+      try { fs.unlinkSync(f); console.log(`[CLEANUP] Borrado: ${f}`); } catch (_) {}
+    }
+  } else {
+    console.log('[CLEANUP] No se encontraron lock files');
+  }
+} catch (e) {
+  console.log('[CLEANUP] Error:', e.message);
+}
 
 startClient().catch((err) => {
   console.error('[SERVER] Error iniciando cliente:', err.message);
