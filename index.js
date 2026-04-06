@@ -200,7 +200,7 @@ function extractDirectTextIntent(text) {
   if (['!clear', '!limpiar', '!cancelar'].includes(low)) return { action: 'clear_pending' };
   if (['!reauth', '!reautenticar'].includes(low)) return { action: 'reauth' };
 
-  if (/^(grupos|envia a grupos|manda a grupos|publica en grupos|mandalo a grupos|mándalo a grupos)$/i.test(t)) {
+  if (/^(grupos|envia a grupos|manda a grupos|mandar a grupos|publica en grupos|mandalo a grupos|mándalo a grupos|mandalos a grupos|mándalos a grupos)$/i.test(t)) {
     return { action: 'send_pending' };
   }
 
@@ -277,6 +277,37 @@ async function handleAdminTextMessage(msg) {
     return;
   }
 
+  if (direct?.action === 'clear_pending') {
+    clearPending();
+    await msg.reply('🗑️ Borré la imagen/video pendiente.');
+    return;
+  }
+
+  if (direct?.action === 'reauth') {
+    await msg.reply('♻️ Reiniciando sesión. Espera a que salga QR en el panel.');
+    await destroyClient({ deleteSession: true });
+    setTimeout(() => startClient().catch((e) => console.error('[WA] Reinit error:', e.message)), 3000);
+    return;
+  }
+
+  // --- Si hay media pendiente, priorizar envío sobre listado ---
+  if (pendingExists()) {
+    if (direct?.action === 'send_pending' || direct?.action === 'list_groups') {
+      // "grupos" con media pendiente = enviar, no listar
+      const caption = direct.caption || state.pending.caption || '';
+      const item = state.pending.items[state.pending.items.length - 1];
+      const result = await sendMediaToGroups({ item, caption });
+      await msg.reply(`📤 Envío de media completado.\n✅ ${result.exitosos} ok\n❌ ${result.fallidos} fallidos`);
+      clearPending();
+      return;
+    }
+
+    // Si hay media pendiente y mandó texto, lo tomamos como caption.
+    state.pending.caption = text;
+    await msg.reply('📝 Caption guardado. Ahora escribe *grupos* para publicarlo.');
+    return;
+  }
+
   if (direct?.action === 'list_groups') {
     const groups = await getSendableGroups().catch(() => []);
     const preview = groups.slice(0, 10).map((g, i) => `${i + 1}. ${g.nombre}`).join('\n');
@@ -299,35 +330,6 @@ async function handleAdminTextMessage(msg) {
         await msg.reply(`❌ Test falló en ${g.nombre}: ${String(err?.message || err)}`);
       }
     }
-    return;
-  }
-
-  if (direct?.action === 'clear_pending') {
-    clearPending();
-    await msg.reply('🗑️ Borré la imagen/video pendiente.');
-    return;
-  }
-
-  if (direct?.action === 'reauth') {
-    await msg.reply('♻️ Reiniciando sesión. Espera a que salga QR en el panel.');
-    await destroyClient({ deleteSession: true });
-    setTimeout(() => startClient().catch((e) => console.error('[WA] Reinit error:', e.message)), 3000);
-    return;
-  }
-
-  if (pendingExists()) {
-    if (direct?.action === 'send_pending') {
-      const caption = direct.caption || state.pending.caption || '';
-      const item = state.pending.items[state.pending.items.length - 1];
-      const result = await sendMediaToGroups({ item, caption });
-      await msg.reply(`📤 Envío de media completado.\n✅ ${result.exitosos} ok\n❌ ${result.fallidos} fallidos`);
-      clearPending();
-      return;
-    }
-
-    // Si hay media pendiente y mandó texto, lo tomamos como caption.
-    state.pending.caption = text;
-    await msg.reply('📝 Caption guardado. Ahora escribe *grupos* para publicarlo.');
     return;
   }
 
