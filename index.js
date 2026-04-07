@@ -29,6 +29,197 @@ const WORKER_URLS = (process.env.WORKER_URLS || '')
   .map(u => u.trim().replace(/\/+$/, ''))
   .filter(Boolean);
 
+// ============ PROGRAMADOR DE ENVÍOS ============
+const SCHEDULE_FILE = path.join(AUTH_ROOT, 'scheduled_jobs.json');
+const TZ = 'America/Mexico_City';
+
+function loadScheduledJobs() {
+  try {
+    if (fs.existsSync(SCHEDULE_FILE)) {
+      const data = JSON.parse(fs.readFileSync(SCHEDULE_FILE, 'utf8'));
+      return Array.isArray(data) ? data : [];
+    }
+  } catch (e) {
+    console.log('[SCHEDULER] Error leyendo jobs:', e.message);
+  }
+  return [];
+}
+
+function saveScheduledJobs(jobs) {
+  try {
+    fs.mkdirSync(path.dirname(SCHEDULE_FILE), { recursive: true });
+    fs.writeFileSync(SCHEDULE_FILE, JSON.stringify(jobs, null, 2), 'utf8');
+  } catch (e) {
+    console.log('[SCHEDULER] Error guardando jobs:', e.message);
+  }
+}
+
+function parseMexicoTime(timeStr) {
+  // Parsea expresiones como: "8pm", "20:00", "hoy 8pm", "mañana 10am", "mañana 15:30"
+  const now = new Date();
+  const mexicoNow = new Date(now.toLocaleString('en-US', { timeZone: TZ }));
+
+  let targetDate = new Date(mexicoNow);
+  let text = String(timeStr || '').toLowerCase().trim();
+
+  // Detectar "mañana"
+  if (text.includes('mañana') || text.includes('manana')) {
+    targetDate.setDate(targetDate.getDate() + 1);
+    text = text.replace(/mañana|manana/g, '').trim();
+  }
+  // Detectar "hoy" (no cambia fecha, solo limpiar)
+  text = text.replace(/hoy/g, '').trim();
+
+  // Parsear hora: "8pm", "8:30pm", "20:00", "8 pm", "10am"
+  let hours = -1, minutes = 0;
+
+  // Formato 12h: 8pm, 8:30pm, 8 pm, 10:00 am
+  const match12 = text.match(/(\d{1,2})(?::(\d{2}))?\s*(am|pm)/i);
+  if (match12) {
+    hours = parseInt(match12[1]);
+    minutes = parseInt(match12[2] || '0');
+    const period = match12[3].toLowerCase();
+    if (period === 'pm' && hours < 12) hours += 12;
+    if (period === 'am' && hours === 12) hours = 0;
+  }
+
+  // Formato 24h: 20:00, 15:30, 08:00
+  if (hours === -1) {
+    const match24 = text.match(/(\d{1,2}):(\d{2})/);
+    if (match24) {
+      hours = parseInt(match24[1]);
+      minutes = parseInt(match24[2]);
+    }
+  }
+
+  // Solo hora sin formato: "8", "20"
+  if (hours === -1) {
+    const matchHour = text.match(/^(\d{1,2})$/);
+    if (matchHour) {
+      hours = parseInt(matchHour[1]);
+      // Si ponen solo "8" y es menor a 7, asumir PM
+      if (hours >= 1 && hours <= 7) hours += 12;
+    }
+  }
+
+  if (hours === -1 || hours > 23 || minutes > 59) return null;
+
+  targetDate.setHours(hours, minutes, 0, 0);
+
+  // Convertir de Mexico a UTC para el timestamp real
+  const mexicoOffset = mexicoNow.getTime() - now.getTime();
+  const utcTarget = new Date(targetDate.getTime() - mexicoOffset);
+
+  // Si ya pasó esa hora hoy y no dijo "mañana", programar para mañana
+  if (utcTarget.getTime() <= Date.now()) {
+    utcTarget.setDate(utcTarget.getDate() + 1);
+    targetDate.setDate(targetDate.getDate() + 1);
+  }
+
+  return { utc: utcTarget.getTime(), display: targetDate };
+}
+
+function formatScheduleTime(utcMs) {
+  return new Date(utcMs).toLocaleString('es-MX', { timeZone: TZ, hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit' });
+}
+
+let scheduledJobs = [];
+let schedulerInterval = null;
+
+function scheduleJob({ target, caption, mediaData, mediaMimetype, mediaFilename, sendAt }) {
+  const job = {
+    id: Date.now(),
+    target, // 'groups', 'status', 'both'
+    caption: caption || '',
+    mediaData: mediaData || null,
+    mediaMimetype: mediaMimetype || null,
+    mediaFilename: mediaFilename || null,
+    sendAt,
+    createdAt: Date.now(),
+    status: 'pending',
+  };
+  scheduledJobs.push(job);
+  saveScheduledJobs(scheduledJobs);
+  console.log(`[SCHEDULER] Job #${job.id} programado para ${formatScheduleTime(sendAt)} → ${target}`);
+  return job;
+}
+
+function cancelJob(index) {
+  if (index < 0 || index >= scheduledJobs.length) return null;
+  const job = scheduledJobs.splice(index, 1)[0];
+  saveScheduledJobs(scheduledJobs);
+  console.log(`[SCHEDULER] Job #${job.id} cancelado`);
+  return job;
+}
+
+async function executeScheduledJob(job) {
+  console.log(`[SCHEDULER] Ejecutando job #${job.id} → ${job.target}`);
+  try {
+    let replyParts = [];
+
+    if (job.mediaData) {
+      // Envío con media
+      const media = new MessageMedia(job.mediaMimetype || 'image/jpeg', job.mediaData, job.mediaFilename || 'archivo');
+      const item = { media, kind: inferMediaKind(job.mediaMimetype) };
+
+      if (job.target === 'groups' || job.target === 'both') {
+        const result = await sendMediaToGroups({ item, caption: job.caption });
+        replyParts.push(`👥 Grupos: ✅ ${result.exitosos} ok, ❌ ${result.fallidos} fallidos`);
+      }
+      if (job.target === 'status' || job.target === 'both') {
+        const statusResults = await broadcastStatus({ item, caption: job.caption });
+        const okCount = statusResults.filter(r => r.ok).length;
+        const failCount = statusResults.filter(r => !r.ok).length;
+        replyParts.push(`📱 Estados: ✅ ${okCount} ok, ❌ ${failCount} fallidos`);
+      }
+    } else if (job.caption) {
+      // Envío solo texto
+      if (job.target === 'groups' || job.target === 'both') {
+        const result = await sendTextToGroups({ message: job.caption });
+        replyParts.push(`👥 Grupos: ✅ ${result.exitosos} ok, ❌ ${result.fallidos} fallidos`);
+      }
+    }
+
+    // Notificar al admin
+    const jid = adminJid();
+    if (jid && state.client && state.ready) {
+      await state.client.sendMessage(jid,
+        `⏰ *Envío programado ejecutado*\n\n${replyParts.join('\n')}\n📝 ${job.caption ? job.caption.slice(0, 50) + '...' : 'sin caption'}`
+      );
+    }
+    console.log(`[SCHEDULER] Job #${job.id} completado`);
+  } catch (err) {
+    console.error(`[SCHEDULER] Job #${job.id} falló:`, err.message);
+    const jid = adminJid();
+    if (jid && state.client && state.ready) {
+      try {
+        await state.client.sendMessage(jid, `❌ Envío programado falló: ${err.message}`);
+      } catch (_) {}
+    }
+  }
+}
+
+function startScheduler() {
+  if (schedulerInterval) return;
+  schedulerInterval = setInterval(async () => {
+    const now = Date.now();
+    const due = scheduledJobs.filter(j => j.status === 'pending' && j.sendAt <= now);
+    for (const job of due) {
+      job.status = 'executing';
+      saveScheduledJobs(scheduledJobs);
+      await executeScheduledJob(job);
+      job.status = 'done';
+    }
+    // Limpiar jobs ejecutados
+    if (due.length > 0) {
+      scheduledJobs = scheduledJobs.filter(j => j.status === 'pending');
+      saveScheduledJobs(scheduledJobs);
+    }
+  }, 30000); // Revisar cada 30 segundos
+  console.log('[SCHEDULER] Iniciado, revisando cada 30s');
+}
+// ============ FIN PROGRAMADOR ============
+
 const state = {
   connected: false,
   ready: false,
@@ -296,8 +487,27 @@ function extractDirectTextIntent(text) {
   if (['!test', '!test-grupos'].includes(low)) return { action: 'test_groups' };
   if (['!clear', '!limpiar', '!cancelar'].includes(low)) return { action: 'clear_pending' };
   if (['!reauth', '!reautenticar'].includes(low)) return { action: 'reauth' };
+  if (['!programados', '!pendientes', '!agenda'].includes(low)) return { action: 'list_scheduled' };
 
-  // "estados" o "ambos" para publicar en estados de WA
+  // !cancelar N → cancelar un programado
+  const cancelMatch = low.match(/^!cancelar\s+(\d+)$/);
+  if (cancelMatch) return { action: 'cancel_scheduled', index: parseInt(cancelMatch[1]) - 1 };
+
+  // Envío programado: "grupos 8pm", "estados mañana 10am", "ambos hoy 20:00"
+  const schedMatch = t.match(/^(grupos|estados|estado|ambos|todo)\s+(.+)$/i);
+  if (schedMatch) {
+    const targetWord = schedMatch[1].toLowerCase();
+    const timeStr = schedMatch[2].trim();
+    const parsed = parseMexicoTime(timeStr);
+    if (parsed) {
+      let target = 'groups';
+      if (/^(estados|estado)$/.test(targetWord)) target = 'status';
+      if (/^(ambos|todo)$/.test(targetWord)) target = 'both';
+      return { action: 'schedule_pending', target, sendAt: parsed.utc, displayTime: formatScheduleTime(parsed.utc) };
+    }
+  }
+
+  // "estados" o "ambos" para publicar en estados de WA (inmediato)
   if (/^(estados|estado)$/i.test(t)) return { action: 'send_pending', target: 'status' };
   if (/^(ambos|todo|grupos\s*y\s*estados|estados\s*y\s*grupos)$/i.test(t)) return { action: 'send_pending', target: 'both' };
 
@@ -392,6 +602,29 @@ async function handleAdminTextMessage(msg) {
     return;
   }
 
+  if (direct?.action === 'list_scheduled') {
+    const pending = scheduledJobs.filter(j => j.status === 'pending');
+    if (!pending.length) {
+      await msg.reply('📋 No hay envíos programados.');
+      return;
+    }
+    const list = pending.map((j, i) =>
+      `${i + 1}. ⏰ ${formatScheduleTime(j.sendAt)} → *${j.target}*\n   📝 ${j.caption ? j.caption.slice(0, 40) : 'sin caption'}${j.mediaData ? ' 📎' : ''}`
+    ).join('\n\n');
+    await msg.reply(`📋 *Envíos programados (${pending.length}):*\n\n${list}\n\nPara cancelar: *!cancelar 1*`);
+    return;
+  }
+
+  if (direct?.action === 'cancel_scheduled') {
+    const job = cancelJob(direct.index);
+    if (job) {
+      await msg.reply(`🗑️ Envío cancelado: ${formatScheduleTime(job.sendAt)} → ${job.target}`);
+    } else {
+      await msg.reply('❌ No existe ese número. Escribe *!programados* para ver la lista.');
+    }
+    return;
+  }
+
   // --- Si hay media pendiente ---
   if (pendingExists()) {
     if (direct?.action === 'send_pending') {
@@ -420,6 +653,23 @@ async function handleAdminTextMessage(msg) {
       return;
     }
 
+    // Programar envío con media
+    if (direct?.action === 'schedule_pending') {
+      const caption = state.pending.caption || '';
+      const item = state.pending.items[state.pending.items.length - 1];
+      const job = scheduleJob({
+        target: direct.target,
+        caption,
+        mediaData: item.media.data,
+        mediaMimetype: item.media.mimetype,
+        mediaFilename: item.media.filename,
+        sendAt: direct.sendAt,
+      });
+      await msg.reply(`⏰ *Programado*\n\n📅 ${direct.displayTime}\n🎯 ${direct.target}\n📝 ${caption ? caption.slice(0, 50) : 'sin caption'}${item ? ' 📎' : ''}\n\nVer todos: *!programados*\nCancelar: *!cancelar 1*`);
+      clearPending();
+      return;
+    }
+
     // !grupos con media pendiente = listar, NO enviar
     if (direct?.action === 'list_groups') {
       const groups = await getSendableGroups().catch(() => []);
@@ -430,7 +680,7 @@ async function handleAdminTextMessage(msg) {
 
     // Cualquier otro texto = caption
     state.pending.caption = text;
-    await msg.reply('📝 Caption guardado. Ahora escribe:\n• *grupos* → enviar a grupos\n• *estados* → publicar en estado de WA\n• *ambos* → grupos + estado');
+    await msg.reply('📝 Caption guardado. Ahora escribe:\n• *grupos* → enviar ahora a grupos\n• *estados* → publicar en estado de WA\n• *ambos* → grupos + estado\n• *grupos 8pm* → programar a las 8pm\n• *ambos mañana 10am* → programar');
     return;
   }
 
@@ -500,7 +750,7 @@ async function handleAdminTextMessage(msg) {
   }
 
   // Fallback simple
-  await msg.reply('🤖 Puedo ayudarte así:\n• Manda una imagen/video y luego: *grupos*, *estados* o *ambos*\n• Texto directo: *manda esto a grupos: tu promo aquí*\n• Comandos: !status, !grupos, !test, !clear, !reauth');
+  await msg.reply('🤖 Puedo ayudarte así:\n• Manda imagen/video y luego: *grupos*, *estados* o *ambos*\n• Programar: *grupos 8pm*, *ambos mañana 10am*\n• Texto directo: *manda esto a grupos: tu promo*\n• Comandos: !status, !grupos, !test, !clear, !programados, !reauth');
 }
 
 async function handleAdminMediaMessage(msg) {
@@ -516,7 +766,7 @@ async function handleAdminMediaMessage(msg) {
   state.pending.caption = String(msg.body || '').trim() || state.pending.caption || '';
 
   const label = kind === 'video' ? 'video' : kind === 'image' ? 'imagen' : 'archivo';
-  const opciones = '• *grupos* → enviar a grupos\n• *estados* → publicar en estado de WA\n• *ambos* → grupos + estado';
+  const opciones = '• *grupos* → enviar a grupos\n• *estados* → publicar en estado de WA\n• *ambos* → grupos + estado\n\n⏰ Programar: *grupos 8pm*, *ambos mañana 10am*';
   if (state.pending.caption) {
     await msg.reply(`📎 Recibí 1 ${label}. Caption guardado.\n\n${opciones}`);
   } else {
@@ -593,6 +843,11 @@ function attachClientEvents(client) {
 
     // Notificar al admin que el bot arrancó
     try {
+      // Cargar jobs pendientes e iniciar scheduler
+      scheduledJobs = loadScheduledJobs();
+      startScheduler();
+      const pendingJobs = scheduledJobs.filter(j => j.status === 'pending').length;
+
       const jid = adminJid();
       if (jid) {
         const groups = await getSendableGroups().catch(() => []);
@@ -602,7 +857,8 @@ function attachClientEvents(client) {
           `🏷️ Sesión: ${SESSION_ID}\n` +
           `👥 Grupos: ${groups.length}\n` +
           `🔗 Workers: ${WORKER_URLS.length}\n` +
-          `⏰ ${new Date().toLocaleString('es-MX', { timeZone: 'America/Mexico_City' })}`
+          `⏰ Programados: ${pendingJobs}\n` +
+          `🕐 ${new Date().toLocaleString('es-MX', { timeZone: 'America/Mexico_City' })}`
         );
       }
     } catch (e) {
@@ -861,12 +1117,33 @@ app.post('/status/publicar', auth, async (req, res) => {
   }
 });
 
+app.get('/programados', auth, (_req, res) => {
+  const pending = scheduledJobs.filter(j => j.status === 'pending');
+  res.json({
+    ok: true,
+    total: pending.length,
+    jobs: pending.map((j, i) => ({
+      num: i + 1,
+      target: j.target,
+      caption: j.caption ? j.caption.slice(0, 80) : '',
+      hasMedia: !!j.mediaData,
+      sendAt: formatScheduleTime(j.sendAt),
+      sendAtUtc: j.sendAt,
+    })),
+  });
+});
+
 app.listen(PORT, () => {
   console.log(`[SERVER] Puerto ${PORT}`);
   console.log(`[SERVER] Session ID: ${SESSION_ID}`);
   console.log(`[SERVER] Admin: ${ADMIN_PHONE || 'no-configurado'}`);
   console.log(`[SERVER] Auth path: ${AUTH_PATH}`);
   console.log(`[SERVER] Workers: ${WORKER_URLS.length ? WORKER_URLS.join(', ') : 'ninguno (hub solo)'}`);
+
+  // Cargar jobs al arrancar (el scheduler se inicia cuando WA conecte)
+  scheduledJobs = loadScheduledJobs();
+  const pendingCount = scheduledJobs.filter(j => j.status === 'pending').length;
+  if (pendingCount > 0) console.log(`[SCHEDULER] ${pendingCount} jobs pendientes cargados`);
 });
 
 // Limpiar lock files de Chromium que sobreviven reinicios en Railway
