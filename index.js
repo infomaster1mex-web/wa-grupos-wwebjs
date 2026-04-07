@@ -590,6 +590,24 @@ function attachClientEvents(client) {
       state.number = null;
     }
     console.log(`[WA] Conectado: ${state.number || 'sin numero'}`);
+
+    // Notificar al admin que el bot arrancó
+    try {
+      const jid = adminJid();
+      if (jid) {
+        const groups = await getSendableGroups().catch(() => []);
+        await client.sendMessage(jid,
+          `🤖 *Bot reiniciado*\n\n` +
+          `📱 Número: ${state.number || '—'}\n` +
+          `🏷️ Sesión: ${SESSION_ID}\n` +
+          `👥 Grupos: ${groups.length}\n` +
+          `🔗 Workers: ${WORKER_URLS.length}\n` +
+          `⏰ ${new Date().toLocaleString('es-MX', { timeZone: 'America/Mexico_City' })}`
+        );
+      }
+    } catch (e) {
+      console.log('[WA] No se pudo notificar al admin:', e.message);
+    }
   });
 
   client.on('change_state', (waState) => {
@@ -621,6 +639,11 @@ function attachClientEvents(client) {
     try {
       if (msg.fromMe) return;
       if (msg.from.endsWith('@g.us')) return;
+      // Ignorar estados, broadcasts y mensajes del sistema
+      if (msg.from === 'status@broadcast') return;
+      if (msg.from.endsWith('@broadcast')) return;
+      if (msg.type === 'e2e_notification' || msg.type === 'notification_template') return;
+      if (msg.isStatus) return;
 
       // Auto-respuesta a no-admins
       if (!isAdminMessage(msg)) {
