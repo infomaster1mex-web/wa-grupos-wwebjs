@@ -26,7 +26,7 @@ const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v
 // Ej: "https://wa-worker1.up.railway.app,https://wa-worker2.up.railway.app"
 const WORKER_URLS = (process.env.WORKER_URLS || '')
   .split(',')
-  .map(u => u.trim())
+  .map(u => u.trim().replace(/\/+$/, ''))
   .filter(Boolean);
 
 const state = {
@@ -247,12 +247,18 @@ async function broadcastStatus({ item, caption }) {
       const mimetype = item.media.mimetype;
       const filename = item.media.filename || 'archivo';
       console.log(`[BROADCAST] Llamando worker: ${workerUrl}`);
-      const res = await fetch(`${workerUrl}/status/publicar`, {
+      const resp = await fetch(`${workerUrl}/status/publicar`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },
         body: JSON.stringify({ media_base64: base64, mimetype, filename, caption }),
       });
-      const data = await res.json();
+      const text = await resp.text();
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        throw new Error(`Worker respondió HTML/no-JSON (status ${resp.status}): ${text.slice(0, 120)}`);
+      }
       results.push({ url: workerUrl, ok: data.ok, error: data.error });
       console.log(`[BROADCAST] Worker ${workerUrl}: ${data.ok ? 'OK' : 'FALLÓ - ' + data.error}`);
     } catch (err) {
