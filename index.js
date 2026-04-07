@@ -204,12 +204,26 @@ async function sendMediaToStatus({ item, caption }) {
   const statusChatId = 'status@broadcast';
   const options = {};
   if (caption) options.caption = caption;
-  await withTimeout(
-    client.sendMessage(statusChatId, item.media, options),
-    GROUP_SEND_TIMEOUT_MS,
-    'Status publish timeout'
-  );
-  console.log('[WA] Estado publicado OK');
+
+  // wwebjs requiere sendSeen antes de publicar estado en algunas versiones
+  try {
+    const statusChat = await client.getChatById(statusChatId);
+    await statusChat.sendSeen();
+  } catch (e) {
+    console.log('[WA] sendSeen status fallido (no crítico):', e.message);
+  }
+
+  try {
+    await withTimeout(
+      client.sendMessage(statusChatId, item.media, options),
+      GROUP_SEND_TIMEOUT_MS,
+      'Status publish timeout'
+    );
+    console.log('[WA] Estado publicado OK');
+  } catch (err) {
+    console.error('[WA] Error publicando estado:', err.message);
+    throw err;
+  }
 }
 
 // Broadcast status a este servicio + todos los workers
@@ -220,8 +234,10 @@ async function broadcastStatus({ item, caption }) {
   try {
     await sendMediaToStatus({ item, caption });
     results.push({ url: 'local', ok: true });
+    console.log('[BROADCAST] Local: OK');
   } catch (err) {
     results.push({ url: 'local', ok: false, error: err.message });
+    console.error('[BROADCAST] Local falló:', err.message);
   }
 
   // Publicar en cada worker
@@ -230,6 +246,7 @@ async function broadcastStatus({ item, caption }) {
       const base64 = item.media.data;
       const mimetype = item.media.mimetype;
       const filename = item.media.filename || 'archivo';
+      console.log(`[BROADCAST] Llamando worker: ${workerUrl}`);
       const res = await fetch(`${workerUrl}/status/publicar`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-api-key': API_KEY },
@@ -237,8 +254,10 @@ async function broadcastStatus({ item, caption }) {
       });
       const data = await res.json();
       results.push({ url: workerUrl, ok: data.ok, error: data.error });
+      console.log(`[BROADCAST] Worker ${workerUrl}: ${data.ok ? 'OK' : 'FALLÓ - ' + data.error}`);
     } catch (err) {
       results.push({ url: workerUrl, ok: false, error: err.message });
+      console.error(`[BROADCAST] Worker ${workerUrl} error:`, err.message);
     }
   }
 
