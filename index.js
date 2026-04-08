@@ -220,6 +220,9 @@ function startScheduler() {
 }
 // ============ FIN PROGRAMADOR ============
 
+// Tiempo de espera para acumular imágenes (ms). Si en ese tiempo llega otra imagen, se resetea.
+const MEDIA_ACCUMULATE_MS = Number(process.env.MEDIA_ACCUMULATE_MS || 8000);
+
 const state = {
   connected: false,
   ready: false,
@@ -234,6 +237,7 @@ const state = {
     items: [],
     caption: '',
     createdAt: 0,
+    accumulateTimer: null, // timer para notificar al admin después del silencio
   },
 };
 
@@ -278,7 +282,10 @@ function isAdminMessage(msg) {
 }
 
 function clearPending() {
-  state.pending = { items: [], caption: '', createdAt: 0 };
+  if (state.pending.accumulateTimer) {
+    clearTimeout(state.pending.accumulateTimer);
+  }
+  state.pending = { items: [], caption: '', createdAt: 0, accumulateTimer: null };
 }
 
 function pendingExists() {
@@ -353,10 +360,13 @@ async function sendTextToGroups({ message, groupIds }) {
   };
 }
 
-async function sendMediaToGroups({ item, caption, groupIds }) {
+async function sendMediaToGroups({ items, item, caption, groupIds }) {
   const client = state.client;
   if (!client || !state.ready) throw new Error('WhatsApp no conectado');
-  if (!item?.media) throw new Error('No hay media pendiente');
+
+  // Soportar tanto items[] (múltiples) como item (singular, retrocompatibilidad)
+  const mediaItems = items && items.length ? items : (item ? [item] : []);
+  if (!mediaItems.length) throw new Error('No hay media pendiente');
 
   const ids = Array.isArray(groupIds) && groupIds.length
     ? groupIds
@@ -367,9 +377,14 @@ async function sendMediaToGroups({ item, caption, groupIds }) {
   for (const gid of ids) {
     try {
       const chat = await withTimeout(client.getChatById(gid), 20000, 'Chat lookup timeout');
-      const options = {};
-      if (caption) options.caption = caption;
-      await withTimeout(chat.sendMessage(item.media, options), GROUP_SEND_TIMEOUT_MS, 'Timed Out');
+      for (let i = 0; i < mediaItems.length; i++) {
+        const mediaItem = mediaItems[i];
+        const options = {};
+        // Solo poner caption en el último archivo del grupo
+        if (caption && i === mediaItems.length - 1) options.caption = caption;
+        await withTimeout(chat.sendMessage(mediaItem.media, options), GROUP_SEND_TIMEOUT_MS, 'Timed Out');
+        if (i < mediaItems.length - 1) await delay(800); // pausa entre archivos del mismo grupo
+      }
       resultados.push({ grupo: gid, ok: true });
       exitosos++;
       await delay(SEND_PAUSE_MS);
@@ -488,6 +503,8 @@ function extractDirectTextIntent(text) {
   if (['!clear', '!limpiar', '!cancelar'].includes(low)) return { action: 'clear_pending' };
   if (['!reauth', '!reautenticar'].includes(low)) return { action: 'reauth' };
   if (['!programados', '!pendientes', '!agenda'].includes(low)) return { action: 'list_scheduled' };
+  // Comando para indicar que se agregarán más archivos (pausa el timer)
+  if (['más', 'mas', '+', 'agrega', 'espera', 'faltan', 'faltan más', 'faltan mas'].includes(low)) return { action: 'more_pending' };
 
   // !cancelar N → cancelar un programado
   const cancelMatch = low.match(/^!cancelar\s+(\d+)$/);
@@ -595,6 +612,20 @@ async function handleAdminTextMessage(msg) {
     return;
   }
 
+  if (direct?.action === 'more_pending') {
+    if (pendingExists()) {
+      // Cancelar el timer para que no pregunte aún
+      if (state.pending.accumulateTimer) {
+        clearTimeout(state.pending.accumulateTimer);
+        state.pending.accumulateTimer = null;
+      }
+      await msg.reply(`⏸️ Ok, manda los archivos que faltan. Tengo ${state.pending.items.length} acumulados.`);
+    } else {
+      await msg.reply('📭 No hay archivos pendientes. Manda las imágenes primero.');
+    }
+    return;
+  }
+
   if (direct?.action === 'reauth') {
     await msg.reply('♻️ Reiniciando sesión. Espera a que salga QR en el panel.');
     await destroyClient({ deleteSession: true });
@@ -625,30 +656,36 @@ async function handleAdminTextMessage(msg) {
     return;
   }
 
-  // --- Si hay media pendiente ---
   if (pendingExists()) {
     if (direct?.action === 'send_pending') {
       const caption = direct.caption || state.pending.caption || '';
-      const item = state.pending.items[state.pending.items.length - 1];
+      const items = state.pending.items;
       const target = direct.target || 'groups';
       let replyParts = [];
 
       if (target === 'groups' || target === 'both') {
-        const result = await sendMediaToGroups({ item, caption });
+        const result = await sendMediaToGroups({ items, caption });
         replyParts.push(`👥 Grupos: ✅ ${result.exitosos} ok, ❌ ${result.fallidos} fallidos`);
       }
       if (target === 'status' || target === 'both') {
         try {
-          const statusResults = await broadcastStatus({ item, caption });
-          const okCount = statusResults.filter(r => r.ok).length;
-          const failCount = statusResults.filter(r => !r.ok).length;
+          // Para estados: enviar cada imagen por separado
+          let okCount = 0, failCount = 0;
+          for (let i = 0; i < items.length; i++) {
+            const isLast = i === items.length - 1;
+            const statusResults = await broadcastStatus({ item: items[i], caption: isLast ? caption : '' });
+            okCount += statusResults.filter(r => r.ok).length;
+            failCount += statusResults.filter(r => !r.ok).length;
+            if (!isLast) await delay(1500);
+          }
           replyParts.push(`📱 Estados: ✅ ${okCount} ok, ❌ ${failCount} fallidos`);
         } catch (err) {
           replyParts.push(`📱 Estados: ❌ ${err.message}`);
         }
       }
 
-      await msg.reply(`📤 Envío completado.\n${replyParts.join('\n')}`);
+      const totalFiles = items.length;
+      await msg.reply(`📤 Envío completado (${totalFiles} ${totalFiles === 1 ? 'archivo' : 'archivos'}).\n${replyParts.join('\n')}`);
       clearPending();
       return;
     }
@@ -750,7 +787,7 @@ async function handleAdminTextMessage(msg) {
   }
 
   // Fallback simple
-  await msg.reply('🤖 Puedo ayudarte así:\n• Manda imagen/video y luego: *grupos*, *estados* o *ambos*\n• Programar: *grupos 8pm*, *ambos mañana 10am*\n• Texto directo: *manda esto a grupos: tu promo*\n• Comandos: !status, !grupos, !test, !clear, !programados, !reauth');
+  await msg.reply('🤖 Puedo ayudarte así:\n• Manda 1 o más imágenes/videos y luego: *grupos*, *estados* o *ambos*\n• Si necesitas mandar más archivos antes de enviar: escribe *más*\n• Programar: *grupos 8pm*, *ambos mañana 10am*\n• Texto directo: *manda esto a grupos: tu promo*\n• Comandos: !status, !grupos, !test, !clear, !programados, !reauth');
 }
 
 async function handleAdminMediaMessage(msg) {
@@ -763,15 +800,44 @@ async function handleAdminMediaMessage(msg) {
   const kind = inferMediaKind(media.mimetype);
   state.pending.items.push({ media, kind, createdAt: Date.now() });
   state.pending.createdAt = Date.now();
-  state.pending.caption = String(msg.body || '').trim() || state.pending.caption || '';
 
+  // Si hay caption en el cuerpo del mensaje, guardarlo
+  const bodyCaption = String(msg.body || '').trim();
+  if (bodyCaption) state.pending.caption = bodyCaption;
+
+  const count = state.pending.items.length;
   const label = kind === 'video' ? 'video' : kind === 'image' ? 'imagen' : 'archivo';
-  const opciones = '• *grupos* → enviar a grupos\n• *estados* → publicar en estado de WA\n• *ambos* → grupos + estado\n\n⏰ Programar: *grupos 8pm*, *ambos mañana 10am*';
-  if (state.pending.caption) {
-    await msg.reply(`📎 Recibí 1 ${label}. Caption guardado.\n\n${opciones}`);
-  } else {
-    await msg.reply(`📎 Recibí 1 ${label}.\nMándame el texto y luego elige destino:\n\n${opciones}`);
+
+  // Cancelar el timer anterior si existía (llegó otra imagen antes de que venciera)
+  if (state.pending.accumulateTimer) {
+    clearTimeout(state.pending.accumulateTimer);
+    state.pending.accumulateTimer = null;
   }
+
+  // Si es la primera imagen, avisar que se está esperando más
+  if (count === 1) {
+    await msg.reply(`📎 Recibí 1 ${label}. Esperando ${MEDIA_ACCUMULATE_MS / 1000}s por si mandas más...`);
+  } else {
+    await msg.reply(`📎 Total: ${count} archivos acumulados. Esperando ${MEDIA_ACCUMULATE_MS / 1000}s más...`);
+  }
+
+  // Iniciar timer: después del silencio, preguntar qué hacer
+  state.pending.accumulateTimer = setTimeout(async () => {
+    state.pending.accumulateTimer = null;
+    const total = state.pending.items.length;
+    const captionInfo = state.pending.caption ? `\n📝 Caption: _${state.pending.caption.slice(0, 60)}_` : '';
+    const opciones = '• *grupos* → enviar a grupos\n• *estados* → publicar en estado de WA\n• *ambos* → grupos + estado\n• *más* → seguir agregando archivos\n• *!clear* → cancelar todo\n\n⏰ Programar: *grupos 8pm*, *ambos mañana 10am*';
+    try {
+      const jid = adminJid();
+      if (jid && state.client) {
+        await state.client.sendMessage(jid,
+          `✅ *${total} ${total === 1 ? 'archivo listo' : 'archivos listos'}*${captionInfo}\n\n¿Qué hago?\n\n${opciones}`
+        );
+      }
+    } catch (e) {
+      console.error('[WA] Error enviando resumen de acumulación:', e.message);
+    }
+  }, MEDIA_ACCUMULATE_MS);
 }
 
 async function destroyClient({ deleteSession = false } = {}) {
@@ -998,7 +1064,7 @@ app.get('/', (_req, res) => {
     <div class="row"><span class="label">Numero:</span> ${state.number || '—'}</div>
     <div class="row"><span class="label">Sesion:</span> ${SESSION_ID}</div>
     <div class="row"><span class="label">Admin:</span> ${ADMIN_PHONE || 'no configurado'}</div>
-    <div class="row"><span class="label">Media pendiente:</span> ${state.pending.items.length}</div>
+    <div class="row"><span class="label">Media pendiente:</span> ${state.pending.items.length} ${state.pending.items.length > 0 ? (state.pending.accumulateTimer ? '⏳ acumulando...' : '✅ listo') : ''}</div>
     ${state.qr ? `<div class="qr"><div>Escanea este QR:</div><img src="${state.qr}" alt="QR" /></div>` : ''}
     <div class="buttons">
       <a class="btn" href="/status">Status JSON</a>
@@ -1011,8 +1077,8 @@ app.get('/', (_req, res) => {
     <div class="help">
       <strong>Uso por WhatsApp con el admin:</strong><br>
       • Manda texto: <code>manda esto a grupos: ...</code><br>
-      • Manda una imagen/video y luego escribe: <code>grupos</code><br>
-      • Si quieres, manda primero el caption y luego <code>grupos</code><br>
+      • Manda 1 o más imágenes/videos → el bot espera 8s por si mandas más → luego escribe: <code>grupos</code>, <code>estados</code> o <code>ambos</code><br>
+      • Si aún faltan más archivos: escribe <code>más</code> para pausar el contador<br>
       • Comandos: <code>!status</code>, <code>!grupos</code>, <code>!test</code>, <code>!clear</code>, <code>!reauth</code>
     </div>
   </div>
