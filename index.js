@@ -159,7 +159,7 @@ async function executeScheduledJob(job) {
 
     if (job.mediaData) {
       // Envío con media
-      const media = new MessageMedia(job.mediaMimetype || 'image/jpeg', job.mediaData, job.mediaFilename || 'archivo');
+      const media = new MessageMedia(job.mediaMimetype || 'application/octet-stream', job.mediaData, job.mediaFilename || 'archivo');
       const item = { media, kind: inferMediaKind(job.mediaMimetype) };
 
       if (job.target === 'groups' || job.target === 'both') {
@@ -382,6 +382,8 @@ async function sendMediaToGroups({ items, item, caption, groupIds }) {
         const options = {};
         // Solo poner caption en el último archivo del grupo
         if (caption && i === mediaItems.length - 1) options.caption = caption;
+        // Enviar video correctamente (sin convertir a GIF mudo)
+        if (mediaItem.kind === 'video') options.sendVideoAsGif = false;
         await withTimeout(chat.sendMessage(mediaItem.media, options), GROUP_SEND_TIMEOUT_MS, 'Timed Out');
         if (i < mediaItems.length - 1) await delay(800); // pausa entre archivos del mismo grupo
       }
@@ -410,6 +412,8 @@ async function sendMediaToStatus({ item, caption }) {
   const statusChatId = 'status@broadcast';
   const options = {};
   if (caption) options.caption = caption;
+  // Enviar video correctamente en estados (sin convertir a GIF mudo)
+  if (item.kind === 'video') options.sendVideoAsGif = false;
 
   // wwebjs requiere sendSeen antes de publicar estado en algunas versiones
   try {
@@ -1174,7 +1178,7 @@ app.post('/status/publicar', auth, async (req, res) => {
     if (!state.ready) return res.status(400).json({ ok: false, error: 'WhatsApp no conectado' });
     if (!media_base64) return res.status(400).json({ ok: false, error: 'Falta media_base64' });
 
-    const media = new MessageMedia(mimetype || 'image/jpeg', media_base64, filename || 'archivo');
+    const media = new MessageMedia(mimetype || 'application/octet-stream', media_base64, filename || 'archivo');
     const item = { media, kind: inferMediaKind(mimetype) };
     await sendMediaToStatus({ item, caption: caption || '' });
     res.json({ ok: true, message: 'Estado publicado' });
