@@ -27,7 +27,13 @@ const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v
 // Cualquier mensaje entrante recibe auto-reply con el número de soporte.
 // Los endpoints HTTP (p.ej. /status/publicar) siguen funcionando: el hub puede seguir
 // ordenándole publicar estados, pero nadie puede controlarlo escribiéndole por WhatsApp.
-const AVISOS_ONLY = String(process.env.AVISOS_ONLY || 'false').toLowerCase() === 'true';
+//
+// Auto-detección: si SESSION_ID contiene "aviso" (p.ej. avisos, avisos2), se activa
+// automáticamente. La variable AVISOS_ONLY, si se define, sobrescribe la auto-detección.
+const AVISOS_ONLY_ENV = process.env.AVISOS_ONLY;
+const AVISOS_ONLY = AVISOS_ONLY_ENV !== undefined
+  ? String(AVISOS_ONLY_ENV).toLowerCase() === 'true'
+  : /aviso/i.test(SESSION_ID);
 const SUPPORT_PHONE_LABEL = process.env.SUPPORT_PHONE_LABEL || '496 147 43 57';
 const AVISOS_REPLY_TEXT = process.env.AVISOS_REPLY_TEXT
   || `📢 Este número es solo de *avisos y promociones*.\n\n📲 Para atención escribe al *${SUPPORT_PHONE_LABEL}*\n¡Gracias!`;
