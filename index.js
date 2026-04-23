@@ -22,6 +22,17 @@ const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
 
+// ============ MODO SOLO AVISOS ============
+// Cuando AVISOS_ONLY=true este bot NO procesa comandos de WA (ni de admin ni de clientes).
+// Cualquier mensaje entrante recibe auto-reply con el número de soporte.
+// Los endpoints HTTP (p.ej. /status/publicar) siguen funcionando: el hub puede seguir
+// ordenándole publicar estados, pero nadie puede controlarlo escribiéndole por WhatsApp.
+const AVISOS_ONLY = String(process.env.AVISOS_ONLY || 'false').toLowerCase() === 'true';
+const SUPPORT_PHONE_LABEL = process.env.SUPPORT_PHONE_LABEL || '496 147 43 57';
+const AVISOS_REPLY_TEXT = process.env.AVISOS_REPLY_TEXT
+  || `📢 Este número es solo de *avisos y promociones*.\n\n📲 Para atención escribe al *${SUPPORT_PHONE_LABEL}*\n¡Gracias!`;
+// ==========================================
+
 // URLs de workers para broadcast de estados (separadas por coma)
 // Ej: "https://wa-worker1.up.railway.app,https://wa-worker2.up.railway.app"
 const WORKER_URLS = (process.env.WORKER_URLS || '')
@@ -921,13 +932,14 @@ function attachClientEvents(client) {
       const jid = adminJid();
       if (jid) {
         const groups = await getSendableGroups().catch(() => []);
+        const modoLine = AVISOS_ONLY ? `\n🔕 *Modo:* solo-avisos (no acepto comandos por WA)` : '';
         await client.sendMessage(jid,
           `🤖 *Bot reiniciado*\n\n` +
           `📱 Número: ${state.number || '—'}\n` +
           `🏷️ Sesión: ${SESSION_ID}\n` +
           `👥 Grupos: ${groups.length}\n` +
           `🔗 Workers: ${WORKER_URLS.length}\n` +
-          `⏰ Programados: ${pendingJobs}\n` +
+          `⏰ Programados: ${pendingJobs}${modoLine}\n` +
           `🕐 ${new Date().toLocaleString('es-MX', { timeZone: 'America/Mexico_City' })}`
         );
       }
@@ -971,10 +983,20 @@ function attachClientEvents(client) {
       if (msg.type === 'e2e_notification' || msg.type === 'notification_template') return;
       if (msg.isStatus) return;
 
-      // Auto-respuesta a no-admins
+      // === MODO SOLO AVISOS ===
+      // Si está activado, NINGÚN mensaje de WA ejecuta lógica de publicador,
+      // ni siquiera del admin. Todos reciben el mismo auto-reply con throttle.
+      if (AVISOS_ONLY) {
+        if (!autoReplyThrottle(msg.from)) return;
+        await msg.reply(AVISOS_REPLY_TEXT);
+        console.log(`[AVISOS_ONLY] Auto-reply enviado a ${msg.from}`);
+        return;
+      }
+
+      // Auto-respuesta a no-admins (modo publicador normal)
       if (!isAdminMessage(msg)) {
         if (!autoReplyThrottle(msg.from)) return; // evitar spam
-        await msg.reply('📢 Este número es solo de *avisos y promociones*.\n\n📲 Para atención escribe al *496 147 43 57*\n¡Gracias!');
+        await msg.reply(AVISOS_REPLY_TEXT);
         return;
       }
 
@@ -1068,6 +1090,7 @@ app.get('/', (_req, res) => {
     <div class="row"><span class="label">Numero:</span> ${state.number || '—'}</div>
     <div class="row"><span class="label">Sesion:</span> ${SESSION_ID}</div>
     <div class="row"><span class="label">Admin:</span> ${ADMIN_PHONE || 'no configurado'}</div>
+    <div class="row"><span class="label">Modo:</span> ${AVISOS_ONLY ? '<span style="color:#ffd166">🔕 Solo-avisos (no procesa comandos por WA)</span>' : '<span style="color:#4ade80">Publicador completo</span>'}</div>
     <div class="row"><span class="label">Media pendiente:</span> ${state.pending.items.length} ${state.pending.items.length > 0 ? (state.pending.accumulateTimer ? '⏳ acumulando...' : '✅ listo') : ''}</div>
     ${state.qr ? `<div class="qr"><div>Escanea este QR:</div><img src="${state.qr}" alt="QR" /></div>` : ''}
     <div class="buttons">
@@ -1209,6 +1232,7 @@ app.listen(PORT, () => {
   console.log(`[SERVER] Admin: ${ADMIN_PHONE || 'no-configurado'}`);
   console.log(`[SERVER] Auth path: ${AUTH_PATH}`);
   console.log(`[SERVER] Workers: ${WORKER_URLS.length ? WORKER_URLS.join(', ') : 'ninguno (hub solo)'}`);
+  console.log(`[SERVER] Modo: ${AVISOS_ONLY ? '🔕 SOLO AVISOS (no procesa comandos por WA)' : 'Publicador completo'}`);
 
   // Cargar jobs al arrancar (el scheduler se inicia cuando WA conecte)
   scheduledJobs = loadScheduledJobs();
