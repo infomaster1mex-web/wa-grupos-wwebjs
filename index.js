@@ -21,6 +21,13 @@ const GROUP_SKIP_COMMUNITIES = String(process.env.GROUP_SKIP_COMMUNITIES || 'tru
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
+// Timeout del protocolo Puppeteer (ms). Default 180s para evitar Runtime.callFunctionOn timeouts
+// en grupos grandes o cuando WA Web tarda en responder. Se puede sobrescribir con env var.
+const PUPPETEER_PROTOCOL_TIMEOUT_MS = Number(process.env.PUPPETEER_PROTOCOL_TIMEOUT_MS || 180000);
+// Margen (ms) antes del 'ready' para considerar un mensaje como "del backlog".
+// Mensajes con timestamp anterior a (readyAt - este margen) se ignoran al reconectar.
+// Default: 60s. Subirlo si quieres ser más estricto (ej. 5 min = 300000).
+const BACKLOG_IGNORE_MS = Number(process.env.BACKLOG_IGNORE_MS || 60000);
 
 // ============ MODO SOLO AVISOS ============
 // Cuando AVISOS_ONLY=true este bot NO procesa comandos de WA (ni de admin ni de clientes).
@@ -250,6 +257,7 @@ const state = {
   initializing: false,
   client: null,
   reconnectTimer: null,
+  readyAt: 0, // timestamp en ms cuando el bot quedó listo (para filtrar backlog)
   pending: {
     items: [],
     caption: '',
@@ -522,6 +530,7 @@ function extractDirectTextIntent(text) {
   if (['!grupos', '!listar', 'lista grupos'].includes(low)) return { action: 'list_groups' };
   if (['!test', '!test-grupos'].includes(low)) return { action: 'test_groups' };
   if (['!clear', '!limpiar', '!cancelar'].includes(low)) return { action: 'clear_pending' };
+  if (['!reset', '!reiniciar'].includes(low)) return { action: 'reset' };
   if (['!reauth', '!reautenticar'].includes(low)) return { action: 'reauth' };
   if (['!programados', '!pendientes', '!agenda'].includes(low)) return { action: 'list_scheduled' };
   // Comando para indicar que se agregarán más archivos (pausa el timer)
@@ -630,6 +639,19 @@ async function handleAdminTextMessage(msg) {
   if (direct?.action === 'clear_pending') {
     clearPending();
     await msg.reply('🗑️ Borré la imagen/video pendiente.');
+    return;
+  }
+
+  if (direct?.action === 'reset') {
+    const hadItems = state.pending.items.length;
+    const hadCaption = !!state.pending.caption;
+    clearPending();
+    await msg.reply(
+      `🔄 *Reset completo*\n\n` +
+      `🗑️ Media pendiente: ${hadItems} ${hadItems === 1 ? 'archivo' : 'archivos'} borrados\n` +
+      `📝 Caption: ${hadCaption ? 'borrado' : 'estaba vacío'}\n\n` +
+      `Listo para empezar de cero. Manda tus archivos.`
+    );
     return;
   }
 
@@ -808,7 +830,7 @@ async function handleAdminTextMessage(msg) {
   }
 
   // Fallback simple
-  await msg.reply('🤖 Puedo ayudarte así:\n• Manda 1 o más imágenes/videos y luego: *grupos*, *estados* o *ambos*\n• Si necesitas mandar más archivos antes de enviar: escribe *más*\n• Programar: *grupos 8pm*, *ambos mañana 10am*\n• Texto directo: *manda esto a grupos: tu promo*\n• Comandos: !status, !grupos, !test, !clear, !programados, !reauth');
+  await msg.reply('🤖 Puedo ayudarte así:\n• Manda 1 o más imágenes/videos y luego: *grupos*, *estados* o *ambos*\n• Si necesitas mandar más archivos antes de enviar: escribe *más*\n• Programar: *grupos 8pm*, *ambos mañana 10am*\n• Texto directo: *manda esto a grupos: tu promo*\n• Comandos: !status, !grupos, !test, !clear, !reset, !programados, !reauth');
 }
 
 async function handleAdminMediaMessage(msg) {
@@ -873,6 +895,7 @@ async function destroyClient({ deleteSession = false } = {}) {
   state.ready = false;
   state.number = null;
   state.qr = null;
+  state.readyAt = 0;
   state.lastState = deleteSession ? 'reauth' : 'disconnected';
 
   if (client) {
@@ -919,6 +942,7 @@ function attachClientEvents(client) {
     state.connected = true;
     state.qr = null;
     state.lastState = 'ready';
+    state.readyAt = Date.now(); // marcar el momento de "listo" para filtrar backlog
     try {
       const info = client.info;
       const wid = info?.wid?._serialized || '';
@@ -926,7 +950,7 @@ function attachClientEvents(client) {
     } catch (_) {
       state.number = null;
     }
-    console.log(`[WA] Conectado: ${state.number || 'sin numero'}`);
+    console.log(`[WA] Conectado: ${state.number || 'sin numero'} | readyAt=${new Date(state.readyAt).toISOString()}`);
 
     // Notificar al admin que el bot arrancó
     try {
@@ -946,7 +970,8 @@ function attachClientEvents(client) {
           `👥 Grupos: ${groups.length}\n` +
           `🔗 Workers: ${WORKER_URLS.length}\n` +
           `⏰ Programados: ${pendingJobs}${modoLine}\n` +
-          `🕐 ${new Date().toLocaleString('es-MX', { timeZone: 'America/Mexico_City' })}`
+          `🕐 ${new Date().toLocaleString('es-MX', { timeZone: 'America/Mexico_City' })}\n\n` +
+          `_Mensajes anteriores al reinicio se ignoran automáticamente._`
         );
       }
     } catch (e) {
@@ -988,6 +1013,17 @@ function attachClientEvents(client) {
       if (msg.from.endsWith('@broadcast')) return;
       if (msg.type === 'e2e_notification' || msg.type === 'notification_template') return;
       if (msg.isStatus) return;
+
+      // === FILTRO DE BACKLOG ===
+      // Cuando el bot reconecta, WhatsApp Web entrega los mensajes acumulados mientras
+      // estuvo desconectado. Ignoramos los que son anteriores a (readyAt - margen).
+      // msg.timestamp viene en SEGUNDOS desde wwebjs.
+      const msgTimeMs = Number(msg.timestamp || 0) * 1000;
+      if (state.readyAt && msgTimeMs && msgTimeMs < (state.readyAt - BACKLOG_IGNORE_MS)) {
+        const ageSeg = Math.round((state.readyAt - msgTimeMs) / 1000);
+        console.log(`[WA] Ignorando mensaje del backlog (${ageSeg}s antes del ready) de ${msg.from}`);
+        return;
+      }
 
       // === MODO SOLO AVISOS ===
       // Si está activado, NINGÚN mensaje de WA ejecuta lógica de publicador,
@@ -1044,6 +1080,9 @@ async function startClient() {
       puppeteer: {
         headless: true,
         executablePath: CHROME_BIN,
+        // FIX: protocolTimeout sube el timeout de Runtime.callFunctionOn (default 30s)
+        // Necesario en Railway con grupos grandes / WA Web lento. Default: 180000 ms (3 min).
+        protocolTimeout: PUPPETEER_PROTOCOL_TIMEOUT_MS,
         args: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
@@ -1097,6 +1136,7 @@ app.get('/', (_req, res) => {
     <div class="row"><span class="label">Sesion:</span> ${SESSION_ID}</div>
     <div class="row"><span class="label">Admin:</span> ${ADMIN_PHONE || 'no configurado'}</div>
     <div class="row"><span class="label">Modo:</span> ${AVISOS_ONLY ? '<span style="color:#ffd166">🔕 Solo-avisos (no procesa comandos por WA)</span>' : '<span style="color:#4ade80">Publicador completo</span>'}</div>
+    <div class="row"><span class="label">Listo desde:</span> ${state.readyAt ? new Date(state.readyAt).toLocaleString('es-MX', { timeZone: TZ }) : '—'}</div>
     <div class="row"><span class="label">Media pendiente:</span> ${state.pending.items.length} ${state.pending.items.length > 0 ? (state.pending.accumulateTimer ? '⏳ acumulando...' : '✅ listo') : ''}</div>
     ${state.qr ? `<div class="qr"><div>Escanea este QR:</div><img src="${state.qr}" alt="QR" /></div>` : ''}
     <div class="buttons">
@@ -1112,7 +1152,7 @@ app.get('/', (_req, res) => {
       • Manda texto: <code>manda esto a grupos: ...</code><br>
       • Manda 1 o más imágenes/videos → el bot espera 8s por si mandas más → luego escribe: <code>grupos</code>, <code>estados</code> o <code>ambos</code><br>
       • Si aún faltan más archivos: escribe <code>más</code> para pausar el contador<br>
-      • Comandos: <code>!status</code>, <code>!grupos</code>, <code>!test</code>, <code>!clear</code>, <code>!reauth</code>
+      • Comandos: <code>!status</code>, <code>!grupos</code>, <code>!test</code>, <code>!clear</code>, <code>!reset</code>, <code>!programados</code>, <code>!reauth</code>
     </div>
   </div>
 </body>
@@ -1129,6 +1169,9 @@ app.get('/status', (_req, res) => {
     session: SESSION_ID,
     admin_phone: ADMIN_PHONE || null,
     pending_media: state.pending.items.length,
+    ready_at: state.readyAt || null,
+    ready_at_iso: state.readyAt ? new Date(state.readyAt).toISOString() : null,
+    backlog_ignore_ms: BACKLOG_IGNORE_MS,
     lastState: state.lastState,
     lastDisconnect: state.lastDisconnect,
   });
@@ -1239,6 +1282,8 @@ app.listen(PORT, () => {
   console.log(`[SERVER] Auth path: ${AUTH_PATH}`);
   console.log(`[SERVER] Workers: ${WORKER_URLS.length ? WORKER_URLS.join(', ') : 'ninguno (hub solo)'}`);
   console.log(`[SERVER] Modo: ${AVISOS_ONLY ? '🔕 SOLO AVISOS (no procesa comandos por WA)' : 'Publicador completo'}`);
+  console.log(`[SERVER] Puppeteer protocolTimeout: ${PUPPETEER_PROTOCOL_TIMEOUT_MS}ms`);
+  console.log(`[SERVER] Backlog ignore margin: ${BACKLOG_IGNORE_MS}ms`);
 
   // Cargar jobs al arrancar (el scheduler se inicia cuando WA conecte)
   scheduledJobs = loadScheduledJobs();
