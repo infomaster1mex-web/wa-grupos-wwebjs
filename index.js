@@ -299,11 +299,31 @@ function adminJid() {
   return ADMIN_PHONE ? `${ADMIN_PHONE}@c.us` : null;
 }
 
-function isAdminMessage(msg) {
+async function isAdminMessage(msg) {
   if (!ADMIN_PHONE) return false;
+
+  // Caso 1: identificador clásico @c.us — comparación directa, sin llamar a getContact()
   const from = normalizePhone(msg.from || '');
   const author = normalizePhone(msg.author || '');
-  return from === ADMIN_PHONE || author === ADMIN_PHONE;
+  if (from === ADMIN_PHONE || author === ADMIN_PHONE) return true;
+
+  // Caso 2: WhatsApp ahora puede entregar el mensaje con un identificador @lid
+  // (LID = identificador opaco interno de WhatsApp, no coincide con el número).
+  // En ese caso resolvemos el WID real con getContact() y comparamos contra
+  // contact.id._serialized (NO contra contact.number, que también puede venir como LID).
+  const fromStr = String(msg.from || '');
+  const authorStr = String(msg.author || '');
+  if (fromStr.endsWith('@lid') || authorStr.endsWith('@lid')) {
+    try {
+      const contact = await msg.getContact();
+      const wid = normalizePhone(contact?.id?._serialized || '');
+      if (wid && wid === ADMIN_PHONE) return true;
+    } catch (e) {
+      console.log('[isAdminMessage] getContact falló:', e.message);
+    }
+  }
+
+  return false;
 }
 
 function clearPending() {
@@ -1006,17 +1026,6 @@ function attachClientEvents(client) {
 
   client.on('message', async (msg) => {
     try {
-      // === DEBUG TEMPORAL: identificar JID/LID del remitente ===
-      // Quitar este bloque una vez confirmado el origen del problema de admin.
-      console.log(`[DEBUG-MSG] from=${msg.from} | author=${msg.author || '-'} | fromMe=${msg.fromMe} | type=${msg.type} | body=${(msg.body || '').slice(0, 80)}`);
-      try {
-        const c = await msg.getContact();
-        console.log(`[DEBUG-CONTACT] number=${c?.number || '-'} | wid=${c?.id?._serialized || '-'} | pushname=${c?.pushname || '-'}`);
-      } catch (e) {
-        console.log(`[DEBUG-CONTACT] error: ${e.message}`);
-      }
-      // === FIN DEBUG TEMPORAL ===
-
       if (msg.fromMe) return;
       if (msg.from.endsWith('@g.us')) return;
       // Ignorar estados, broadcasts y mensajes del sistema
@@ -1047,7 +1056,7 @@ function attachClientEvents(client) {
       }
 
       // Auto-respuesta a no-admins (modo publicador normal)
-      if (!isAdminMessage(msg)) {
+      if (!(await isAdminMessage(msg))) {
         if (!autoReplyThrottle(msg.from)) return; // evitar spam
         await msg.reply(AVISOS_REPLY_TEXT);
         return;
