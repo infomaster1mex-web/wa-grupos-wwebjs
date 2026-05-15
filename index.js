@@ -1006,6 +1006,17 @@ function attachClientEvents(client) {
 
   client.on('message', async (msg) => {
     try {
+      // === DEBUG TEMPORAL: identificar JID/LID del remitente ===
+      // Quitar este bloque una vez confirmado el origen del problema de admin.
+      console.log(`[DEBUG-MSG] from=${msg.from} | author=${msg.author || '-'} | fromMe=${msg.fromMe} | type=${msg.type} | body=${(msg.body || '').slice(0, 80)}`);
+      try {
+        const c = await msg.getContact();
+        console.log(`[DEBUG-CONTACT] number=${c?.number || '-'} | wid=${c?.id?._serialized || '-'} | pushname=${c?.pushname || '-'}`);
+      } catch (e) {
+        console.log(`[DEBUG-CONTACT] error: ${e.message}`);
+      }
+      // === FIN DEBUG TEMPORAL ===
+
       if (msg.fromMe) return;
       if (msg.from.endsWith('@g.us')) return;
       // Ignorar estados, broadcasts y mensajes del sistema
